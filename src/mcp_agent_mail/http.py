@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
@@ -1554,14 +1554,29 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # Add direct routes at no-slash base paths to tolerate clients omitting trailing slashes.
     def _register_base_passthrough(base_path_no_slash: str, base_path_with_slash: str) -> None:
         @fastapi_app.post(base_path_no_slash)
-        async def _base_passthrough(request: Request) -> JSONResponse:
-            # Re-dispatch to mounted stateless app by calling it directly
-            response_body: dict[str, Any] = {}
+        async def _base_passthrough(request: Request) -> Response:
+            # Re-dispatch to the mounted stateless MCP app by calling it
+            # directly, then relay its response BYTES verbatim.
+            #
+            # Two things must NOT be done here:
+            #   1. Do not re-render the body. The old code re-parsed the upstream
+            #      JSON and re-serialized it via JSONResponse; that produces a
+            #      different byte length for multibyte payloads.
+            #   2. Do not forward the upstream Content-Length. Starlette keeps a
+            #      caller-supplied content-length verbatim -- init_headers sets
+            #      ``populate_content_length = b"content-length" not in keys`` and
+            #      never recomputes it -- so a re-rendered multibyte body shipped
+            #      under the stale byte count crashed uvicorn with "Response
+            #      content longer than Content-Length" (intermittent fetch_inbox
+            #      read failures).
+            # Accumulating the raw chunks also fixes a latent multi-chunk bug:
+            # the old _send overwrote the body on every http.response.body chunk.
+            raw_chunks: list[bytes] = []
             status_code = 200
             headers: dict[str, str] = {}
 
             async def _send(message: MutableMapping[str, Any]) -> None:
-                nonlocal response_body, status_code, headers
+                nonlocal status_code, headers
                 if message.get("type") == "http.response.start":
                     status_code = int(message.get("status", 200))
                     hdrs = message.get("headers") or []
@@ -1569,10 +1584,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         headers[k.decode("latin1")] = v.decode("latin1")
                 elif message.get("type") == "http.response.body":
                     body = message.get("body") or b""
-                    try:
-                        response_body = json.loads(body.decode("utf-8")) if body else {}
-                    except Exception:
-                        response_body = {}
+                    if body:
+                        raw_chunks.append(body)
 
             # If localhost and allow_localhost_unauthenticated, synthesize Authorization header automatically
             scope = dict(request.scope)
@@ -1590,7 +1603,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 request.receive,
                 _send,
             )
-            return JSONResponse(response_body, status_code=status_code, headers=headers)
+            raw_body = b"".join(raw_chunks)
+            # Strip headers that must not describe / must be recomputed for the
+            # relayed body:
+            #   - content-length: recomputed by Starlette from raw_body once
+            #     absent (this is the fix for the stale-CL crash).
+            #   - transfer-encoding: hop-by-hop; the ASGI server owns framing, and
+            #     forwarding "chunked" onto a fixed-length Response is invalid.
+            # content-type and content-encoding are preserved verbatim -- the
+            # bytes are relayed as-is, so both remain accurate (the in-process MCP
+            # app does not compress, so content-encoding is in practice absent).
+            passthrough_headers = {
+                k: v
+                for k, v in headers.items()
+                if k.lower() not in {"content-length", "transfer-encoding"}
+            }
+            return Response(
+                content=raw_body,
+                status_code=status_code,
+                headers=passthrough_headers,
+            )
 
     passthrough_pairs: list[tuple[str, str]] = [(base_no_slash, base_with_slash)]
     for compat_base in ("/api", "/mcp"):
